@@ -7,7 +7,7 @@ import os
 
 app = FastAPI(title="Codolio Scraper API", version="1.0.0")
 
-# CORS configuration
+# CORS dddddconfiguration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
