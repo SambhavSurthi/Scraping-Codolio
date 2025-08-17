@@ -3,11 +3,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from pydantic import BaseModel
-import os
 
-app = FastAPI(title="Codolio Scraper API", version="1.0.0")
+app = FastAPI(title="Codolio Scraper API", version="2.0.0")
 
-# CORS dddddconfiguration
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,11 +21,9 @@ class UsernameRequest(BaseModel):
 
 
 async def scrape_codolio(username: str):
-    """Scrape Codolio profile data for a given username"""
     url = f"https://codolio.com/profile/{username}/problemSolving"
 
     async with async_playwright() as p:
-        # Launch browser with optimized settings for deployment
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -39,21 +36,18 @@ async def scrape_codolio(username: str):
                 "--single-process"
             ]
         )
-
         context = await browser.new_context(
             viewport={"width": 1280, "height": 720},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/115 Safari/537.36"
         )
         page = await context.new_page()
 
         try:
-            # Navigate and wait for content
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_selector("text=Total Questions", timeout=20000)
-
-            # Wait for dynamic content to load
-            await page.wait_for_timeout(3000)
-
+            await page.wait_for_timeout(2000)  # let JS render
         except PWTimeout:
             await browser.close()
             raise HTTPException(status_code=504, detail=f"Timeout loading profile for {username}")
@@ -61,94 +55,112 @@ async def scrape_codolio(username: str):
             await browser.close()
             raise HTTPException(status_code=500, detail=f"Failed to load profile: {str(e)}")
 
-        data = {"basicStats": {}, "problemsSolved": {}, "contestRankings": {}}
+        data = {
+            "basicStats": {},
+            "problemsSolved": {},
+            "contestRankings": {},
+            "heatmap": [],
+            "dsaTopics": {}
+        }
 
         try:
-            # Helper function to extract numbers after text labels
-            async def get_number_after_text(label: str):
+            # Helper: extract number after label
+            async def extract_stat(label: str):
                 try:
-                    loc = page.get_by_text(label, exact=False).first
-                    if await loc.count() == 0:
+                    locator = page.get_by_text(label, exact=False).first
+                    if await locator.count() == 0:
                         return None
-
-                    js_code = """
-                    (el, label) => {
-                      const root = el.closest('[class*="MuiCard"]') || el.parentElement || el;
-                      const text = (root.innerText || "").replace(/\\u00A0/g, ' ').trim();
-                      const idx = text.toLowerCase().indexOf(label.toLowerCase());
-                      if (idx >= 0) {
-                        const after = text.slice(idx);
-                        const match = after.match(/(\\d+(?:,\\d+)*)/);
-                        if (match) return match[1];
-                      }
-                      const fallback = text.match(/(\\d+(?:,\\d+)*)/);
-                      return fallback ? fallback[1] : null;
-                    }
-                    """
-                    return await loc.evaluate(js_code, label)
+                    return await locator.evaluate(
+                        "(el) => el.nextElementSibling ? el.nextElementSibling.innerText.trim() : null"
+                    )
                 except:
                     return None
 
-            async def find_number_by_regex(pattern: str):
-                try:
-                    html = await page.content()
-                    match = re.search(pattern, html, flags=re.IGNORECASE)
-                    return match.group(1) if match else None
-                except:
-                    return None
+            # ---------- Basic Stats ----------
+            data["basicStats"]["total_questions"] = await extract_stat("Total Questions") or "0"
+            data["basicStats"]["total_active_days"] = await extract_stat("Total Active Days") or "0"
 
-            # Extract basic stats
-            data["basicStats"]["total_questions"] = await get_number_after_text("Total Questions")
-            data["basicStats"]["total_active_days"] = await get_number_after_text("Total Active Days")
-            data["basicStats"]["total_submissions"] = await find_number_by_regex(r">\s*(\d+)\s*submissions\b")
-            data["basicStats"]["max_streak"] = await get_number_after_text("Max.Streak")
-            data["basicStats"]["current_streak"] = await get_number_after_text("Current.Streak")
-            data["basicStats"]["total_contests"] = await get_number_after_text("Total Contests")
-            data["basicStats"]["awards"] = await get_number_after_text("Awards")
+            # Submissions
+            try:
+                submissions_el = page.get_by_text(re.compile(r"\d+\s+submissions", re.I)).first
+                if await submissions_el.count() > 0:
+                    txt = await submissions_el.inner_text()
+                    data["basicStats"]["total_submissions"] = txt.replace("submissions", "").strip()
+                else:
+                    data["basicStats"]["total_submissions"] = "0"
+            except:
+                data["basicStats"]["total_submissions"] = "0"
 
-            # Extract problems solved breakdown
-            problem_categories = [
-                ("Fundamentals", "fundamentals"),
-                ("DSA", "dsa"),
-                ("Easy", "easy"),
-                ("Medium", "medium"),
-                ("Hard", "hard"),
-                ("Competitive Programming", "competitive_programming"),
-                ("Codechef", "codechef"),
-                ("Codeforces", "codeforces"),
-                ("HackerRank", "hackerrank"),
+            data["basicStats"]["max_streak"] = await extract_stat("Max.Streak") or "0"
+            data["basicStats"]["current_streak"] = await extract_stat("Current.Streak") or "0"
+            data["basicStats"]["total_contests"] = await extract_stat("Total Contests") or "0"
+            data["basicStats"]["awards"] = await extract_stat("Awards") or "0"
+
+            # ---------- Problems Solved ----------
+            problem_labels = [
+                "Fundamentals", "DSA", "Easy", "Medium", "Hard",
+                "Competitive Programming", "Codechef", "Codeforces", "HackerRank"
             ]
-
-            for label, key in problem_categories:
-                val = await get_number_after_text(label)
+            for label in problem_labels:
+                val = await extract_stat(label)
+                key = label.lower().replace(" ", "_")
                 data["problemsSolved"][key] = val or "0"
 
-            # Extract contest rankings
-            async def extract_rating(site_label: str):
+            # ---------- Contest Rankings ----------
+            contest_sites = ["LeetCode", "CodeChef", "Codeforces", "HackerRank"]
+            for site in contest_sites:
                 try:
-                    loc = page.get_by_text(site_label, exact=False).first
-                    if await loc.count() == 0:
-                        return None
-
-                    js_code = """
-                    (el) => {
-                      const root = el.closest('[class*="MuiCard"]') || el.parentElement || el;
-                      const text = (root.innerText || "").replace(/\\u00A0/g, ' ');
-                      const matches = text.match(/\\b(\\d{3,5})\\b/g) || [];
-                      return matches.length ? matches[matches.length - 1] : null;
-                    }
-                    """
-                    return await loc.evaluate(js_code)
+                    loc = page.get_by_text(site, exact=False).first
+                    if await loc.count() > 0:
+                        rating = await loc.evaluate("""
+                            (el) => {
+                                const parent = el.closest('[class*="MuiCard"]') || el.parentElement;
+                                if (!parent) return "0";
+                                const span = parent.querySelector("span");
+                                if (!span) return "0";
+                                const match = span.innerText.match(/\\d+/);
+                                return match ? match[0] : "0";
+                            }
+                        """)
+                        data["contestRankings"][site.lower()] = {"rating": rating or "0"}
+                    else:
+                        data["contestRankings"][site.lower()] = {"rating": "0"}
                 except:
-                    return None
+                    data["contestRankings"][site.lower()] = {"rating": "0"}
 
-            leetcode_rating = await extract_rating("LeetCode")
-            if leetcode_rating:
-                data["contestRankings"]["leetcode"] = {"rating": leetcode_rating}
+            # ---------- Heatmap ----------
+            try:
+                data["heatmap"] = await page.eval_on_selector_all(
+                    "svg.react-calendar-heatmap rect",
+                    """(rects) => rects.map(r => {
+                        const tooltip = r.getAttribute("data-tooltip-content") || "";
+                        const match = tooltip.match(/(\\d+)\\s+submissions\\s+on\\s+(\\d{2}\\/\\d{2}\\/\\d{4})/);
+                        if (match) {
+                            return {
+                                date: match[2],
+                                submissions: parseInt(match[1], 10),
+                                colorClass: r.getAttribute("class") || "",
+                                styleColor: r.style.fill || r.style.backgroundColor || ""
+                            };
+                        }
+                        return null;
+                    }).filter(x => x !== null)"""
+                )
+            except:
+                data["heatmap"] = []
 
-            codechef_rating = await extract_rating("CodeChef")
-            if codechef_rating:
-                data["contestRankings"]["codechef"] = {"rating": codechef_rating}
+            # ---------- DSA Topics ----------
+            try:
+                topic_els = await page.query_selector_all(".dsa-topic-item")
+                for t in topic_els:
+                    try:
+                        name = await t.query_selector_eval(".topic-name", "el => el.innerText.trim()")
+                        solved = await t.query_selector_eval(".topic-solved", "el => el.innerText.trim()")
+                        data["dsaTopics"][name] = solved
+                    except:
+                        continue
+            except:
+                data["dsaTopics"] = {}
 
         except Exception as e:
             await browser.close()
@@ -158,66 +170,31 @@ async def scrape_codolio(username: str):
         return data
 
 
+# ------------------ API Routes ------------------
 @app.get("/")
 async def root():
-    return {
-        "message": "Codolio Scraper API",
-        "version": "1.0.0",
-        "status": "active",
-        "endpoints": {
-            "GET /health": "Health check",
-            "GET /codolio/{username}": "Get profile data for username",
-            "POST /codolio": "Get profile data via POST request"
-        },
-        "example": "/codolio/SambhavSurthi"
-    }
+    return {"message": "Codolio Scraper API", "status": "active"}
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "message": "API is running"}
+    return {"status": "healthy"}
 
 
 @app.get("/codolio/{username}")
-async def get_codolio_profile(username: str):
-    """Get Codolio profile data for a specific username"""
-    if not username or len(username.strip()) == 0:
-        raise HTTPException(status_code=400, detail="Username cannot be empty")
-
-    try:
-        data = await scrape_codolio(username.strip())
-        return {
-            "success": True,
-            "username": username,
-            "data": data
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def get_profile(username: str):
+    if not username.strip():
+        raise HTTPException(status_code=400, detail="Username required")
+    return {"success": True, "username": username, "data": await scrape_codolio(username.strip())}
 
 
 @app.post("/codolio")
-async def post_codolio_profile(request: UsernameRequest):
-    """Get Codolio profile data via POST request"""
-    if not request.username or len(request.username.strip()) == 0:
-        raise HTTPException(status_code=400, detail="Username cannot be empty")
-
-    try:
-        data = await scrape_codolio(request.username.strip())
-        return {
-            "success": True,
-            "username": request.username,
-            "data": data
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def post_profile(request: UsernameRequest):
+    if not request.username.strip():
+        raise HTTPException(status_code=400, detail="Username required")
+    return {"success": True, "username": request.username, "data": await scrape_codolio(request.username.strip())}
 
 
-# For local development
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
