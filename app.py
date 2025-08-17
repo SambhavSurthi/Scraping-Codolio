@@ -1,5 +1,5 @@
 import re
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from pydantic import BaseModel
@@ -176,8 +176,9 @@ async def root():
     return {"message": "Codolio Scraper API", "status": "active"}
 
 
-@app.get("/health")
-async def health_check():
+# ✅ Health endpoint that supports both GET and HEAD
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health_check(request: Request):
     return {"status": "healthy"}
 
 
