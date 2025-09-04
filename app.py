@@ -45,9 +45,9 @@ async def scrape_codolio(username: str):
         page = await context.new_page()
 
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_selector("text=Total Questions", timeout=20000)
-            await page.wait_for_timeout(2000)  # let JS render
+            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            await page.wait_for_selector("text=Total Questions", timeout=90000)
+            await page.wait_for_timeout(5000)  # let JS render
         except PWTimeout:
             await browser.close()
             raise HTTPException(status_code=504, detail=f"Timeout loading profile for {username}")
@@ -199,3 +199,4 @@ async def post_profile(request: UsernameRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
